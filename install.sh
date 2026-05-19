@@ -20,6 +20,8 @@ ACME_EMAIL="${ACME_EMAIL:-}"
 INSTALL_MODE="${INSTALL_MODE:-registry}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 GHCR_TOKEN="${GHCR_TOKEN:-$GITHUB_TOKEN}"
+# GHCR requires your GitHub username for PAT login — NOT the literal "github".
+GHCR_USER="${GHCR_USER:-$GHCR_OWNER}"
 
 usage() {
   cat <<EOF
@@ -40,9 +42,10 @@ Options:
   --install-mode registry|source   Default: registry
   --github-token <token>       Private git sparse clone
   --ghcr-token <token>         GHCR pull (defaults to github-token)
+  --ghcr-user <name>           GHCR login username (default: pimccontent)
   --image-tag <tag>            Image tag (default: latest)
 
-Env: REPO_OWNER, REPO_NAME, INSTALL_DIR, INSTALL_MODE, GITHUB_TOKEN, GHCR_TOKEN
+Env: REPO_OWNER, REPO_NAME, INSTALL_DIR, INSTALL_MODE, GITHUB_TOKEN, GHCR_TOKEN, GHCR_USER
 
 Docs: deploy/PRIVATE-GITHUB-INSTALL.md
 
@@ -56,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --install-mode) INSTALL_MODE="${2:-}"; shift 2 ;;
     --github-token) GITHUB_TOKEN="${2:-}"; shift 2 ;;
     --ghcr-token) GHCR_TOKEN="${2:-}"; shift 2 ;;
+    --ghcr-user) GHCR_USER="${2:-}"; shift 2 ;;
     --image-tag) IMAGE_TAG="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *)
@@ -162,7 +166,31 @@ ghcr_login() {
     echo "ERROR: GHCR_TOKEN (or --github-token) required for registry install (read:packages)." >&2
     exit 1
   fi
-  echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GHCR_USER:-github}" --password-stdin
+  echo "Logging in to ghcr.io as user ${GHCR_USER} ..." >&2
+  if ! echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin; then
+    echo "ERROR: docker login ghcr.io failed." >&2
+    exit 1
+  fi
+}
+
+ghcr_verify_images() {
+  local backend="${LEO_BACKEND_IMAGE:-ghcr.io/${GHCR_OWNER}/leocastra-backend:${IMAGE_TAG}}"
+  local frontend="${LEO_FRONTEND_IMAGE:-ghcr.io/${GHCR_OWNER}/leocastra-frontend:${IMAGE_TAG}}"
+  local img
+  for img in "$backend" "$frontend"; do
+    echo "Verifying pull access: ${img}" >&2
+    if ! docker manifest inspect "$img" >/dev/null 2>&1; then
+      echo "" >&2
+      echo "ERROR: Cannot pull ${img}" >&2
+      echo "  - Use a Classic PAT with scopes: read:packages AND repo" >&2
+      echo "  - Or fine-grained PAT: Packages (read) + repository access to leocastra-cloud-studio" >&2
+      echo "  - docker login must use your GitHub username (${GHCR_USER}), not 'github'" >&2
+      echo "  - In GitHub → Packages → link each package to leocastra-cloud-studio" >&2
+      echo "  - Test: echo \"\$GHCR_TOKEN\" | docker login ghcr.io -u ${GHCR_USER} --password-stdin" >&2
+      echo "         docker pull ${img}" >&2
+      exit 1
+    fi
+  done
 }
 
 write_docker_env() {
@@ -264,7 +292,9 @@ start_stack() {
   cd "$(compose_dir)"
 
   if [[ "$INSTALL_MODE" == "registry" ]]; then
+    load_install_env
     ghcr_login
+    ghcr_verify_images
     compose_run pull
     compose_run up -d --no-build
     return 0
