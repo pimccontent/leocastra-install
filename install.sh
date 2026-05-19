@@ -25,28 +25,15 @@ GHCR_USER="${GHCR_USER:-$GHCR_OWNER}"
 
 usage() {
   cat <<EOF
-LeoCastra Cloud Broadcast Studio — one-command install (Ubuntu)
+LeoCastra — one-command install (Ubuntu)
 
-Private source + GHCR images (recommended):
-
-  export GITHUB_TOKEN="ghp_xxxx"    # scopes: read:packages, repo
   curl -fsSL https://raw.githubusercontent.com/${BOOTSTRAP_REPO_DEFAULT}/main/install.sh \\
-    | sudo -E bash -s -- \\
+    | sudo bash -s -- \\
         --domain studio.example.com \\
-        --email admin@example.com \\
-        --github-token "\$GITHUB_TOKEN"
+        --email you@example.com \\
+        --github-token ghp_YOUR_CLASSIC_TOKEN
 
-Options:
-  --domain <fqdn>              Required on first install
-  --email <addr>               Let's Encrypt contact
-  --install-mode registry|source   Default: registry
-  --github-token <token>       Private git sparse clone
-  --ghcr-token <token>         GHCR pull (defaults to github-token)
-  --ghcr-user <name>           GHCR login username (default: pimccontent)
-  --image-tag <tag>            Image tag (default: latest)
-
-Env: REPO_OWNER, REPO_NAME, INSTALL_DIR, INSTALL_MODE, GITHUB_TOKEN, GHCR_TOKEN, GHCR_USER
-
+GitHub token (classic): enable read:packages + repo only.
 Docs: deploy/PRIVATE-GITHUB-INSTALL.md
 
 EOF
@@ -57,7 +44,7 @@ while [[ $# -gt 0 ]]; do
     --domain) DOMAIN="${2:-}"; shift 2 ;;
     --email) ACME_EMAIL="${2:-}"; shift 2 ;;
     --install-mode) INSTALL_MODE="${2:-}"; shift 2 ;;
-    --github-token) GITHUB_TOKEN="${2:-}"; shift 2 ;;
+    --github-token|--token) GITHUB_TOKEN="${2:-}"; shift 2 ;;
     --ghcr-token) GHCR_TOKEN="${2:-}"; shift 2 ;;
     --ghcr-user) GHCR_USER="${2:-}"; shift 2 ;;
     --image-tag) IMAGE_TAG="${2:-}"; shift 2 ;;
@@ -69,6 +56,33 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# One token drives git sparse-clone + GHCR pull (classic PAT: read:packages + repo).
+GHCR_TOKEN="${GHCR_TOKEN:-$GITHUB_TOKEN}"
+
+require_install_token() {
+  if [[ "$INSTALL_MODE" != "registry" ]]; then
+    return 0
+  fi
+  if [[ -n "$GITHUB_TOKEN" ]]; then
+    return 0
+  fi
+  echo "ERROR: --github-token is required (classic PAT with read:packages + repo)." >&2
+  echo "" >&2
+  echo "Example:" >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/${BOOTSTRAP_REPO_DEFAULT}/main/install.sh \\" >&2
+  echo "    | sudo bash -s -- --domain studio.example.com --email you@example.com --github-token ghp_xxxx" >&2
+  exit 1
+}
+
+load_domain_from_existing_env() {
+  local env_path
+  env_path="$(compose_dir)/.env"
+  if [[ -n "$DOMAIN" || ! -f "$env_path" ]]; then
+    return 0
+  fi
+  DOMAIN="$(grep -E '^[[:space:]]*DOMAIN=' "$env_path" | head -n1 | cut -d= -f2- | tr -d '"' | tr -d '\r' || true)"
+}
 
 compose_dir() {
   if [[ -n "$REPO_SUBDIR" ]]; then
@@ -181,13 +195,10 @@ ghcr_verify_images() {
     echo "Verifying pull access: ${img}" >&2
     if ! docker manifest inspect "$img" >/dev/null 2>&1; then
       echo "" >&2
-      echo "ERROR: Cannot pull ${img}" >&2
-      echo "  - Use a Classic PAT with scopes: read:packages AND repo" >&2
-      echo "  - Or fine-grained PAT: Packages (read) + repository access to leocastra-cloud-studio" >&2
-      echo "  - docker login must use your GitHub username (${GHCR_USER}), not 'github'" >&2
-      echo "  - In GitHub → Packages → link each package to leocastra-cloud-studio" >&2
-      echo "  - Test: echo \"\$GHCR_TOKEN\" | docker login ghcr.io -u ${GHCR_USER} --password-stdin" >&2
-      echo "         docker pull ${img}" >&2
+      echo "ERROR: Cannot access ${img}" >&2
+      echo "Your --github-token needs classic scopes: read:packages AND repo." >&2
+      echo "Also link both GHCR packages to leocastra-cloud-studio (GitHub → Packages)." >&2
+      echo "Then run the same install command again." >&2
       exit 1
     fi
   done
@@ -346,6 +357,8 @@ EOF
 
 require_root
 export DEBIAN_FRONTEND=noninteractive
+require_install_token
+load_domain_from_existing_env
 
 case "$INSTALL_MODE" in
   registry|source) ;;
