@@ -140,6 +140,22 @@ git_clone_url() {
   fi
 }
 
+# After sparse-clone, always continue with deploy/ubuntu-one-command.sh from the
+# private repo so a stale public install.sh (leocastra-install) cannot miss new
+# env vars or GHCR images. LEO_INSTALL_DELEGATED=1 skips re-exec on the second pass.
+delegate_to_cloned_installer() {
+  local local_installer="${INSTALL_DIR}/deploy/ubuntu-one-command.sh"
+  if [[ -n "${LEO_INSTALL_DELEGATED:-}" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$local_installer" ]]; then
+    return 0
+  fi
+  echo "Delegating to latest installer: ${local_installer}" >&2
+  export LEO_INSTALL_DELEGATED=1
+  exec env LEO_INSTALL_DELEGATED=1 bash "$local_installer" "$@"
+}
+
 clone_or_update_repo() {
   mkdir -p "$INSTALL_DIR"
   local url
@@ -190,18 +206,28 @@ ghcr_login() {
 ghcr_verify_images() {
   local backend="${LEO_BACKEND_IMAGE:-ghcr.io/${GHCR_OWNER}/leocastra-backend:${IMAGE_TAG}}"
   local frontend="${LEO_FRONTEND_IMAGE:-ghcr.io/${GHCR_OWNER}/leocastra-frontend:${IMAGE_TAG}}"
+  local radio_sfu="${LEO_RADIO_SFU_IMAGE:-ghcr.io/${GHCR_OWNER}/leocastra-radio-sfu:${IMAGE_TAG}}"
   local img
-  for img in "$backend" "$frontend"; do
+  for img in "$backend" "$frontend" "$radio_sfu"; do
     echo "Verifying pull access: ${img}" >&2
     if ! docker manifest inspect "$img" >/dev/null 2>&1; then
       echo "" >&2
       echo "ERROR: Cannot access ${img}" >&2
       echo "Your --github-token needs classic scopes: read:packages AND repo." >&2
-      echo "Also link both GHCR packages to leocastra-cloud-studio (GitHub → Packages)." >&2
+      echo "Also link all GHCR packages (backend, frontend, radio-sfu) to leocastra-cloud-studio." >&2
       echo "Then run the same install command again." >&2
       exit 1
     fi
   done
+}
+
+append_docker_env_default() {
+  local env_path="$1"
+  local key="$2"
+  local value="$3"
+  if ! grep -qE "^[[:space:]]*${key}=" "$env_path" 2>/dev/null; then
+    echo "${key}=${value}" >> "$env_path"
+  fi
 }
 
 write_docker_env() {
@@ -216,7 +242,8 @@ write_docker_env() {
     # Preserve secrets on update; refresh image pins + install metadata.
     local backend_image="ghcr.io/${GHCR_OWNER}/leocastra-backend:${IMAGE_TAG}"
     local frontend_image="ghcr.io/${GHCR_OWNER}/leocastra-frontend:${IMAGE_TAG}"
-    grep -v -E '^(LEO_BACKEND_IMAGE|LEO_FRONTEND_IMAGE|LEO_IMAGE_TAG|INSTALL_MODE|REPO_OWNER|REPO_NAME|GHCR_OWNER|GIT_BRANCH)=' "$env_path" > "${env_path}.tmp" || true
+    local radio_sfu_image="ghcr.io/${GHCR_OWNER}/leocastra-radio-sfu:${IMAGE_TAG}"
+    grep -v -E '^(LEO_BACKEND_IMAGE|LEO_FRONTEND_IMAGE|LEO_RADIO_SFU_IMAGE|LEO_IMAGE_TAG|INSTALL_MODE|REPO_OWNER|REPO_NAME|GHCR_OWNER|GIT_BRANCH)=' "$env_path" > "${env_path}.tmp" || true
     cat >> "${env_path}.tmp" <<EOF
 INSTALL_MODE=${INSTALL_MODE}
 REPO_OWNER=${REPO_OWNER}
@@ -225,9 +252,13 @@ GHCR_OWNER=${GHCR_OWNER}
 GIT_BRANCH=${GIT_BRANCH}
 LEO_BACKEND_IMAGE=${backend_image}
 LEO_FRONTEND_IMAGE=${frontend_image}
+LEO_RADIO_SFU_IMAGE=${radio_sfu_image}
 LEO_IMAGE_TAG=${IMAGE_TAG}
 EOF
     mv "${env_path}.tmp" "$env_path"
+    append_docker_env_default "$env_path" SRT_INGEST_PORT_MIN 10080
+    append_docker_env_default "$env_path" SRT_INGEST_PORT_MAX 10089
+    append_docker_env_default "$env_path" RADIO_OB_DEFAULT_LATENCY_MS 120
     chmod 600 "$env_path"
     return 0
   fi
@@ -245,6 +276,7 @@ EOF
   INSTALLER_BOOTSTRAP_TOKEN="lc_bootstrap_$(rand_hex 12)"
   local backend_image="ghcr.io/${GHCR_OWNER}/leocastra-backend:${IMAGE_TAG}"
   local frontend_image="ghcr.io/${GHCR_OWNER}/leocastra-frontend:${IMAGE_TAG}"
+  local radio_sfu_image="ghcr.io/${GHCR_OWNER}/leocastra-radio-sfu:${IMAGE_TAG}"
 
   cat > "$env_path" <<EOF
 DOMAIN=${DOMAIN}
@@ -260,7 +292,10 @@ STREAMING_RTMP_BASE=rtmp://${DOMAIN}:1935
 STREAMING_RTMP_BASE_INTERNAL=rtmp://leocastra-streaming:1935
 STREAMING_SRT_BASE=srt://${DOMAIN}:10080
 SRT_PUBLIC_HOST=${DOMAIN}
+SRT_INGEST_PORT_MIN=10080
+SRT_INGEST_PORT_MAX=10089
 SRT_DEFAULT_LATENCY_MS=400
+RADIO_OB_DEFAULT_LATENCY_MS=120
 STREAM_LATENCY_PROFILE=balanced
 HLS_SEGMENT_SECONDS=2
 HLS_LIST_SIZE=8
@@ -277,6 +312,7 @@ GHCR_OWNER=${GHCR_OWNER}
 GIT_BRANCH=${GIT_BRANCH}
 LEO_BACKEND_IMAGE=${backend_image}
 LEO_FRONTEND_IMAGE=${frontend_image}
+LEO_RADIO_SFU_IMAGE=${radio_sfu_image}
 LEO_IMAGE_TAG=${IMAGE_TAG}
 EOF
   chmod 600 "$env_path"
@@ -372,6 +408,7 @@ apt-get update -y
 apt-get install -y git openssl curl
 install_docker_if_needed
 clone_or_update_repo
+delegate_to_cloned_installer "$@"
 write_docker_env
 load_install_env
 ensure_swap_if_low_ram
